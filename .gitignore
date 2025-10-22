@@ -1,0 +1,9 @@
+node_modules/
+*.mbtiles
+*.log
+.DS_Store
+.env
+*.png
+2maps-loader
+dist/
+build/

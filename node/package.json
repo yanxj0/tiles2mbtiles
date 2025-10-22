@@ -1,0 +1,24 @@
+{
+  "name": "2maps-loader",
+  "version": "1.0.0",
+  "description": "CLI tool for downloading raster map tiles to MBTiles format",
+  "main": "index.js",
+  "bin": {
+    "2maps-loader": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["maps", "tiles", "mbtiles", "cli", "download"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^11.1.0",
+    "sqlite3": "^5.1.6",
+    "axios": "^1.5.0",
+    "jimp": "^0.22.10"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

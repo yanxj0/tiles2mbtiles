@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: amd64
+            target: linux-amd64
+          - os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            target: linux-arm64
+          - os: macos-latest
+            platform: darwin
+            arch: amd64
+            target: darwin-amd64
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+            target: darwin-arm64
+          - os: windows-latest
+            platform: windows
+            arch: amd64
+            target: windows-amd64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Build
+      run: |
+        cd go
+        GOOS=${{ matrix.platform }} GOARCH=${{ matrix.arch }} go build -o ../dist/2maps-loader-${{ matrix.target }} main.go
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: 2maps-loader-${{ matrix.target }}
+        path: dist/2maps-loader-${{ matrix.target }}
+        retention-days: 1
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+
+    - name: Display structure of downloaded files
+      run: ls -R dist
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          dist/2maps-loader-linux-amd64/2maps-loader-linux-amd64
+          dist/2maps-loader-linux-arm64/2maps-loader-linux-arm64
+          dist/2maps-loader-darwin-amd64/2maps-loader-darwin-amd64
+          dist/2maps-loader-darwin-arm64/2maps-loader-darwin-arm64
+          dist/2maps-loader-windows-amd64/2maps-loader-windows-amd64
+        body: |
+          ## 2maps-loader ${{ github.ref_name }}
+
+          Cross-platform CLI tool for downloading raster map tiles to MBTiles format.
+
+          ### Features
+          - Download map tiles from any tile server to MBTiles format
+          - Render images from MBTiles databases
+          - Concurrent downloading with configurable concurrency
+          - Support for multiple zoom levels and bounding boxes
+
+          ### Usage
+          ```bash
+          # Download tiles
+          ./2maps-loader download \
+            --corner1 "37.8,-122.5" \
+            --corner2 "37.7,-122.4" \
+            --max-zoom 10 \
+            --url-template "https://tile.openstreetmap.org/{z}/{x}/{y}.png" \
+            --output map.mbtiles
+
+          # Render image from MBTiles
+          ./2maps-loader test \
+            --input map.mbtiles \
+            --output map.png
+          ```
+
+          ### Supported Platforms
+          - Linux (amd64, arm64)
+          - macOS (amd64, arm64)
+          - Windows (amd64)
