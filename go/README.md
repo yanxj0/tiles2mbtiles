@@ -6,6 +6,7 @@ A Go implementation of the 2maps-loader CLI tool for downloading raster map tile
 
 - **Download map tiles** from any tile server to MBTiles format
 - **Render images** from MBTiles databases
+- **Generate preview images** (512x512) from MBTiles files
 - **Concurrent downloading** with configurable concurrency
 - **Cross-platform** support (Linux, macOS, Windows)
 - **Coordinate conversion** from latitude/longitude to tile coordinates
@@ -27,6 +28,7 @@ Download the pre-built binary for your platform from the [Releases page](https:/
 
 ## Usage
 
+
 ### Download Map Tiles
 
 ```bash
@@ -34,6 +36,8 @@ Download the pre-built binary for your platform from the [Releases page](https:/
   --corner1 "37.8,-122.5" \
   --corner2 "37.7,-122.4" \
   --max-zoom 10 \
+  --zoom 10 \
+  --referer "https://retromap.ru/" \
   --url-template "https://tile.openstreetmap.org/{z}/{x}/{y}.png" \
   --output map.mbtiles \
   --concurrency 5
@@ -42,6 +46,8 @@ Download the pre-built binary for your platform from the [Releases page](https:/
 **Parameters:**
 - `--corner1`, `--corner2`: Two corner coordinates in "lat,lng" format
 - `--max-zoom`: Maximum zoom level to download (0-20+)
+- `--zoom`: (Optional) Download only this zoom level
+- `--referer`: (Optional) Referer header to send with tile requests
 - `--url-template`: URL template with {z}, {x}, {y} placeholders
 - `--output`: Output MBTiles file path
 - `--concurrency`: Number of concurrent downloads (default: 5)
@@ -57,6 +63,20 @@ Download the pre-built binary for your platform from the [Releases page](https:/
 **Parameters:**
 - `--input`: Input MBTiles file path
 - `--output`: Output image file path (supports .png, .jpg, .jpeg)
+
+### Generate Preview Image from MBTiles
+
+```bash
+./2maps-loader preview \
+  --input map.mbtiles \
+  --output preview.png
+```
+
+**Parameters:**
+- `--input`: Input MBTiles file path
+- `--output`: Output preview image file path (supports .png, .jpg, .jpeg)
+- `--width`: Preview image width in pixels (default: 512)
+- `--height`: Preview image height in pixels (default: 512)
 
 ## Supported Tile Servers
 

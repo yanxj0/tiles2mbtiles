@@ -61,6 +61,14 @@ type MBTilesTester struct {
 	OutputFile string
 }
 
+// MBTilesPreview handles generating preview images from MBTiles databases
+type MBTilesPreview struct {
+	InputFile  string
+	OutputFile string
+	Width      int
+	Height     int
+}
+
 // deg2num converts latitude/longitude to tile coordinates
 func deg2num(latDeg, lonDeg float64, zoom int) (int, int) {
 	latRad := latDeg * math.Pi / 180
@@ -379,6 +387,229 @@ func (mt *MBTilesTester) MBTilesRowToY(tileRow, zoomLevel int) int {
 	return int(math.Pow(2, float64(zoomLevel))) - 1 - tileRow
 }
 
+// GetMetadata retrieves metadata from MBTiles database
+func (mp *MBTilesPreview) GetMetadata() (map[string]string, error) {
+	db, err := sql.Open("sqlite3", mp.InputFile)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT name, value FROM metadata")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	metadata := make(map[string]string)
+	for rows.Next() {
+		var name, value string
+		err := rows.Scan(&name, &value)
+		if err != nil {
+			return nil, err
+		}
+		metadata[name] = value
+	}
+
+	return metadata, nil
+}
+
+// GetCenterTile finds the center tile for preview generation
+func (mp *MBTilesPreview) GetCenterTile(maxZoom int) (int, int, error) {
+	db, err := sql.Open("sqlite3", mp.InputFile)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer db.Close()
+
+	// Get all tiles at max zoom level
+	rows, err := db.Query(`
+		SELECT tile_column, tile_row 
+		FROM tiles 
+		WHERE zoom_level = ? 
+		ORDER BY tile_column, tile_row
+	`, maxZoom)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+
+	var tiles []struct {
+		X int
+		Y int
+	}
+
+	for rows.Next() {
+		var x, y int
+		err := rows.Scan(&x, &y)
+		if err != nil {
+			return 0, 0, err
+		}
+		tiles = append(tiles, struct {
+			X int
+			Y int
+		}{X: x, Y: y})
+	}
+
+	if len(tiles) == 0 {
+		return 0, 0, fmt.Errorf("no tiles found at zoom level %d", maxZoom)
+	}
+
+	// Find the center tile
+	centerIndex := len(tiles) / 2
+	return tiles[centerIndex].X, tiles[centerIndex].Y, nil
+}
+
+// MBTilesRowToY converts MBTiles row to standard tile y coordinate
+func (mp *MBTilesPreview) MBTilesRowToY(tileRow, zoomLevel int) int {
+	return int(math.Pow(2, float64(zoomLevel))) - 1 - tileRow
+}
+
+// GeneratePreview generates a 512x512 preview image from MBTiles database
+func (mp *MBTilesPreview) GeneratePreview() error {
+	fmt.Printf("Generating preview from MBTiles database: %s\n", mp.InputFile)
+
+	// Get metadata to understand the map
+	metadata, err := mp.GetMetadata()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Map metadata: %+v\n", metadata)
+
+	// Get max zoom level
+	maxZoom, err := mp.GetMaxZoomLevel()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Maximum zoom level: %d\n", maxZoom)
+
+	// Find center tile for preview
+	centerX, centerY, err := mp.GetCenterTile(maxZoom)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Center tile coordinates: X=%d, Y=%d\n", centerX, centerY)
+
+	// Calculate how many tiles we need for 512x512 preview
+	tileSize := 256
+	tilesPerSide := mp.Width / tileSize
+	if tilesPerSide < 1 {
+		tilesPerSide = 1
+	}
+
+	// Create base image
+	baseImage := image.NewRGBA(image.Rect(0, 0, mp.Width, mp.Height))
+	gray := color.RGBA{0xf0, 0xf0, 0xf0, 0xff}
+	draw.Draw(baseImage, baseImage.Bounds(), &image.Uniform{gray}, image.Point{}, draw.Src)
+
+	// Calculate tile range - convert MBTiles row to standard tile Y coordinate
+	startX := centerX - tilesPerSide/2
+	startY := mp.MBTilesRowToY(centerY, maxZoom) - tilesPerSide/2
+
+	// Load and draw tiles
+	db, err := sql.Open("sqlite3", mp.InputFile)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	drawnTiles := 0
+	for xOffset := 0; xOffset < tilesPerSide; xOffset++ {
+		for yOffset := 0; yOffset < tilesPerSide; yOffset++ {
+			tileX := startX + xOffset
+			tileY := startY + yOffset
+
+			// Convert standard tile Y back to MBTiles row for query
+			mbtilesRow := mp.MBTilesRowToY(tileY, maxZoom)
+
+			// Get tile data
+			var tileData []byte
+			err := db.QueryRow(`
+				SELECT tile_data 
+				FROM tiles 
+				WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?
+			`, maxZoom, tileX, mbtilesRow).Scan(&tileData)
+
+			if err != nil {
+				// Skip missing tiles
+				continue
+			}
+
+			// Decode tile image
+			tileImage, _, err := image.Decode(strings.NewReader(string(tileData)))
+			if err != nil {
+				fmt.Printf("Failed to decode tile %d/%d: %v\n", tileX, tileY, err)
+				continue
+			}
+
+			// Calculate position in preview image
+			posX := xOffset * tileSize
+			posY := yOffset * tileSize
+
+			// Draw the tile
+			draw.Draw(baseImage, image.Rect(posX, posY, posX+tileSize, posY+tileSize), tileImage, image.Point{}, draw.Over)
+			drawnTiles++
+
+			fmt.Printf("\rDrawing tiles: %d", drawnTiles)
+		}
+	}
+
+	fmt.Println()
+
+	// Ensure output directory exists
+	outputDir := filepath.Dir(mp.OutputFile)
+	err = os.MkdirAll(outputDir, 0755)
+	if err != nil {
+		return err
+	}
+
+	// Create output file
+	outputFile, err := os.Create(mp.OutputFile)
+	if err != nil {
+		return err
+	}
+	defer outputFile.Close()
+
+	// Determine output format from file extension
+	ext := strings.ToLower(filepath.Ext(mp.OutputFile))
+	switch ext {
+	case ".jpg", ".jpeg":
+		err = jpeg.Encode(outputFile, baseImage, &jpeg.Options{Quality: 90})
+	case ".png":
+		err = png.Encode(outputFile, baseImage)
+	default:
+		// Default to PNG
+		err = png.Encode(outputFile, baseImage)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Preview image saved to: %s\n", mp.OutputFile)
+	fmt.Printf("Successfully drew %d tiles\n", drawnTiles)
+	fmt.Printf("Preview dimensions: %dx%d\n", mp.Width, mp.Height)
+	return nil
+}
+
+// GetMaxZoomLevel gets the maximum zoom level from the database
+func (mp *MBTilesPreview) GetMaxZoomLevel() (int, error) {
+	db, err := sql.Open("sqlite3", mp.InputFile)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+
+	var maxZoom int
+	err = db.QueryRow("SELECT MAX(zoom_level) as max_zoom FROM tiles").Scan(&maxZoom)
+	if err != nil {
+		return 0, err
+	}
+
+	return maxZoom, nil
+}
+
 // RenderImage renders an image from MBTiles database
 func (mt *MBTilesTester) RenderImage() error {
 	fmt.Printf("Reading MBTiles database: %s\n", mt.InputFile)
@@ -640,6 +871,41 @@ func main() {
 					}
 
 					return downloader.Download()
+				},
+			},
+			{
+				Name:  "preview",
+				Usage: "Generate a 512x512 preview image from MBTiles database",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:     "input",
+						Usage:    "Input MBTiles file path",
+						Required: true,
+					},
+					&cli.StringFlag{
+						Name:     "output",
+						Usage:    "Output preview image file path",
+						Required: true,
+					},
+					&cli.IntFlag{
+						Name:  "width",
+						Usage: "Preview image width (default: 512)",
+						Value: 512,
+					},
+					&cli.IntFlag{
+						Name:  "height",
+						Usage: "Preview image height (default: 512)",
+						Value: 512,
+					},
+				},
+				Action: func(c *cli.Context) error {
+					preview := &MBTilesPreview{
+						InputFile:  c.String("input"),
+						OutputFile: c.String("output"),
+						Width:      c.Int("width"),
+						Height:     c.Int("height"),
+					}
+					return preview.GeneratePreview()
 				},
 			},
 		},
