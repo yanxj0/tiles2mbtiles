@@ -112,6 +112,17 @@ func (td *TileDownloader) DownloadTile(tile Tile) DownloadedTile {
 	url = strings.ReplaceAll(url, "{x}", strconv.Itoa(tile.X))
 	url = strings.ReplaceAll(url, "{y}", strconv.Itoa(tile.Y))
 
+	// TMS indexing: {-y} is (2^zoom - 1) - y
+	tmsY := int(math.Pow(2, float64(tile.Z))) - 1 - tile.Y
+	url = strings.ReplaceAll(url, "{-y}", strconv.Itoa(tmsY))
+
+	// Subdomain replacement: {s} picks from a, b, c
+	if strings.Contains(url, "{s}") {
+		subdomains := []string{"a", "b", "c"}
+		s := subdomains[time.Now().UnixNano()%int64(len(subdomains))]
+		url = strings.ReplaceAll(url, "{s}", s)
+	}
+
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
@@ -122,6 +133,7 @@ func (td *TileDownloader) DownloadTile(tile Tile) DownloadedTile {
 		// handle error
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+	req.Header.Set("cookie", "uid=AAAAEWkbUP20v13xAwMeAg==")
 	if td.Referer != nil {
 		req.Header.Set("referer", *td.Referer)
 	}

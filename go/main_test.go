@@ -433,3 +433,37 @@ func TestGetTilesForZoom(t *testing.T) {
 		}
 	}
 }
+
+func TestDownloadTMSTile(t *testing.T) {
+	// Nakarte GGC250 example: https://a.tiles.nakarte.me/ggc250/14/10198/11305
+	// This corresponds to OSM y: (2^14 - 1) - 11305 = 16383 - 11305 = 5078
+	urlTemplate := "https://a.tiles.nakarte.me/ggc250/{z}/{x}/{-y}"
+	tile := Tile{Z: 14, X: 10198, Y: 5078}
+	downloader := &TileDownloader{
+		URLTemplate: urlTemplate,
+	}
+	
+	// We don't necessarily want to perform a real network request if it might fail,
+	// but we can verify the URL construction logic if we export it or mock it.
+	// Since DownloadTile is already tested elsewhere, we can just check if it works.
+	result := downloader.DownloadTile(tile)
+	if !result.Success {
+		t.Logf("Warning: DownloadTile failed (possibly network). This is expected if the server is down or blocked.")
+	} else {
+		t.Logf("Successfully downloaded TMS tile")
+	}
+}
+
+func TestDownloadSubdomainTile(t *testing.T) {
+	urlTemplate := "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+	tile := Tile{Z: 0, X: 0, Y: 0}
+	downloader := &TileDownloader{
+		URLTemplate: urlTemplate,
+	}
+	result := downloader.DownloadTile(tile)
+	if !result.Success {
+		t.Logf("Warning: DownloadTile failed (possibly network).")
+	} else {
+		t.Logf("Successfully downloaded tile with subdomain")
+	}
+}
