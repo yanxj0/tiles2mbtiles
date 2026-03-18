@@ -211,6 +211,37 @@ class TileDownloader {
     };
   }
 
+  async getMissingTilesBatch(db, tiles) {
+    if (tiles.length === 0) return [];
+
+    // 准备 (z,x,y_mb) 元组列表，y_mb 是 MBTiles 的 tile_row
+    const conditions = tiles.map(
+      (t) => `(${t.z}, ${t.x}, ${Math.pow(2, t.z) - 1 - t.y})`,
+    );
+    const sql = `
+    SELECT zoom_level, tile_column, tile_row
+    FROM tiles
+    WHERE (zoom_level, tile_column, tile_row) IN (${conditions.join(",")})
+  `;
+
+    return new Promise((resolve, reject) => {
+      db.all(sql, (err, rows) => {
+        if (err) return reject(err);
+
+        const existingSet = new Set(
+          rows.map((r) => `${r.zoom_level},${r.tile_column},${r.tile_row}`),
+        );
+
+        const missing = tiles.filter((t) => {
+          const key = `${t.z},${t.x},${Math.pow(2, t.z) - 1 - t.y}`;
+          return !existingSet.has(key);
+        });
+
+        resolve(missing);
+      });
+    });
+  }
+
   async download() {
     console.log("Starting memory-friendly tile download...");
     console.log(
@@ -246,16 +277,29 @@ class TileDownloader {
       for (let i = 0; i < tilesThisZoom.length; i += this.batchSize) {
         const batchStartTime = Date.now();
 
-        const batch = tilesThisZoom.slice(i, i + this.batchSize);
         const batchIndex = Math.floor(i / this.batchSize) + 1;
         const batchTotal = Math.ceil(tilesThisZoom.length / this.batchSize);
+        const batch = tilesThisZoom.slice(i, i + this.batchSize);
 
         console.log(
-          `│  Batch ${batchIndex}/${batchTotal} (${batch.length} tiles)`,
+          `│  Batch ${batchIndex}/${batchTotal} checking (${batch.length} tiles)`,
         );
 
-        let { successful, failed } = await this.downloadTiles(
-          batch,
+        // ───── 新增：只保留真正缺失的 ─────
+        const toDownload = await this.getMissingTilesBatch(db, batch);
+
+        if (toDownload.length === 0) {
+          console.log(`│    All tiles already exist → skipped`);
+          continue;
+        }
+
+        console.log(
+          `│    Need to download ${toDownload.length}/${batch.length} missing tiles`,
+        );
+
+        // 然后正常下载、插入
+        const { successful, failed } = await this.downloadTiles(
+          toDownload,
           batchIndex,
           batchTotal,
         );
