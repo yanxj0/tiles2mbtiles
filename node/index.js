@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-const { program } = require('commander');
-const sqlite3 = require('sqlite3').verbose();
-const axios = require('axios');
-const path = require('path');
-const fs = require('fs');
-const Jimp = require('jimp');
+const { program } = require("commander");
+const sqlite3 = require("sqlite3").verbose();
+const axios = require("axios");
+const path = require("path");
+const fs = require("fs");
+const Jimp = require("jimp");
 
 class TileDownloader {
   constructor(options) {
@@ -15,189 +15,340 @@ class TileDownloader {
     this.urlTemplate = options.urlTemplate;
     this.outputFile = options.outputFile;
     this.concurrency = options.concurrency || 5;
+    this.batchSize = options.batchSize || 1000;
+    this.retryLimit = 3; // 每个瓦片最多重试几次
+    this.progressInterval = 50; // 每下载多少个更新一次进度条
   }
 
-  // Convert latitude/longitude to tile coordinates
   deg2num(lat_deg, lon_deg, zoom) {
     const lat_rad = (lat_deg * Math.PI) / 180;
     const n = Math.pow(2, zoom);
     const xtile = Math.floor(((lon_deg + 180) / 360) * n);
     const ytile = Math.floor(
-      ((1 - Math.log(Math.tan(lat_rad) + 1 / Math.cos(lat_rad)) / Math.PI) / 2) * n
+      ((1 - Math.log(Math.tan(lat_rad) + 1 / Math.cos(lat_rad)) / Math.PI) /
+        2) *
+        n,
     );
     return { x: xtile, y: ytile };
   }
 
-  // Get all tile coordinates for the given bounding box and zoom levels
-  getTileCoordinates() {
-    const tiles = [];
-    
-    for (let zoom = 0; zoom <= this.maxZoom; zoom++) {
-      const topLeftTile = this.deg2num(this.topLeft.lat, this.topLeft.lng, zoom);
-      const bottomRightTile = this.deg2num(this.bottomRight.lat, this.bottomRight.lng, zoom);
-      
-      for (let x = topLeftTile.x; x <= bottomRightTile.x; x++) {
-        for (let y = topLeftTile.y; y <= bottomRightTile.y; y++) {
-          tiles.push({ z: zoom, x, y });
-        }
-      }
-    }
-    
-    return tiles;
-  }
-
-  // Download a single tile
   async downloadTile(tile) {
     const url = this.urlTemplate
-      .replace('{z}', tile.z)
-      .replace('{x}', tile.x)
-      .replace('{y}', tile.y);
-    
+      .replace("{z}", tile.z)
+      .replace("{x}", tile.x)
+      .replace("{y}", tile.y);
+
     try {
       const response = await axios.get(url, {
-        responseType: 'arraybuffer',
-        timeout: 30000
+        responseType: "arraybuffer",
+        timeout: 30000,
       });
-      
-      return {
-        ...tile,
-        data: response.data,
-        success: true
-      };
+      return { ...tile, data: response.data, success: true };
     } catch (error) {
-      console.error(`Failed to download tile ${tile.z}/${tile.x}/${tile.y}: ${error.message}`);
-      return {
-        ...tile,
-        data: null,
-        success: false
-      };
+      console.error(
+        `Failed to download tile ${tile.z}/${tile.x}/${tile.y}: ${error.message}`,
+      );
+      return { ...tile, data: null, success: false };
     }
   }
 
-  // Download tiles with concurrency control
-  async downloadTiles(tiles) {
-    const results = [];
+  async downloadTiles(tiles, batchIndex, batchTotal) {
+    const successful = [];
+    const failed = [];
+    let completed = 0;
+
     const queue = [...tiles];
-    
+    const total = tiles.length;
+
+    // 用于控制进度更新的频率
+    let lastPrinted = 0;
+
+    const updateProgress = () => {
+      const percent = Math.round((completed / total) * 100);
+      process.stdout.write(
+        `\r  Batch ${batchIndex}/${batchTotal} progress: ${percent}% (${completed}/${total})   `,
+      );
+      lastPrinted = completed;
+    };
+
     const worker = async () => {
       while (queue.length > 0) {
         const tile = queue.shift();
-        if (tile) {
-          const result = await this.downloadTile(tile);
-          results.push(result);
-          
-          // Progress indicator
-          const progress = Math.round(((results.length / tiles.length) * 100));
-          process.stdout.write(`\rProgress: ${progress}% (${results.length}/${tiles.length})`);
+        if (!tile) continue;
+
+        const result = await this.downloadTile(tile);
+        completed++;
+
+        if (result.success) {
+          successful.push(result);
+        } else {
+          failed.push(tile); // 只保留坐标，稍后重试
+        }
+
+        // 控制刷新频率，避免太频繁
+        if (
+          completed - lastPrinted >= this.progressInterval ||
+          completed === total
+        ) {
+          updateProgress();
         }
       }
     };
-    
-    // Start workers
-    const workers = Array(this.concurrency).fill().map(() => worker());
+
+    const workers = Array(this.concurrency)
+      .fill()
+      .map(() => worker());
     await Promise.all(workers);
-    
-    process.stdout.write('\n');
-    return results.filter(result => result.success);
+
+    // 最终确保显示 100%
+    updateProgress();
+    process.stdout.write("\n");
+
+    return { successful, failed };
+  }
+  // ────────────────────────────────────────────────
+  // 新增：重试一批失败的瓦片
+  // ────────────────────────────────────────────────
+  async retryFailedTiles(failedTiles, currentRetryCount = 1) {
+    if (failedTiles.length === 0 || currentRetryCount > this.retryLimit) {
+      if (failedTiles.length > 0) {
+        console.warn(
+          `  → ${failedTiles.length} tiles still failed after ${this.retryLimit} retries`,
+        );
+      }
+      return { successful: [], stillFailed: failedTiles };
+    }
+
+    console.log(
+      `  Retrying ${failedTiles.length} failed tiles (attempt ${currentRetryCount}/${this.retryLimit})...`,
+    );
+
+    const { successful, failed } = await this.downloadTiles(
+      failedTiles,
+      "retry",
+      "retry", // 临时标记，不影响显示
+    );
+
+    if (failed.length > 0) {
+      return await this.retryFailedTiles(failed, currentRetryCount + 1);
+    }
+
+    return { successful, stillFailed: [] };
   }
 
-  // Create MBTiles database
   createMBTilesDatabase() {
     return new Promise((resolve, reject) => {
       const db = new sqlite3.Database(this.outputFile);
-      
+
       db.serialize(() => {
-        // Create metadata table
-        db.run(`CREATE TABLE IF NOT EXISTS metadata (
-          name TEXT PRIMARY KEY,
-          value TEXT
-        )`);
-        
-        // Create tiles table
+        db.run(
+          `CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT)`,
+        );
         db.run(`CREATE TABLE IF NOT EXISTS tiles (
-          zoom_level INTEGER,
-          tile_column INTEGER,
-          tile_row INTEGER,
-          tile_data BLOB,
+          zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB,
           PRIMARY KEY (zoom_level, tile_column, tile_row)
         )`);
-        
-        // Insert metadata
+
         const metadata = [
-          ['name', 'Map Tiles'],
-          ['type', 'baselayer'],
-          ['version', '1.0'],
-          ['description', 'Downloaded map tiles'],
-          ['format', 'png'],
-          ['bounds', `${this.topLeft.lng},${this.bottomRight.lat},${this.bottomRight.lng},${this.topLeft.lat}`]
+          ["name", "Map Tiles"],
+          ["type", "baselayer"],
+          ["version", "1.0"],
+          ["description", "Downloaded map tiles"],
+          ["format", "png"],
+          [
+            "bounds",
+            `${this.topLeft.lng},${this.bottomRight.lat},${this.bottomRight.lng},${this.topLeft.lat}`,
+          ],
         ];
-        
-        const stmt = db.prepare('INSERT OR REPLACE INTO metadata (name, value) VALUES (?, ?)');
-        metadata.forEach(([name, value]) => stmt.run(name, value));
+
+        const stmt = db.prepare(
+          "INSERT OR REPLACE INTO metadata (name, value) VALUES (?, ?)",
+        );
+        metadata.forEach(([n, v]) => stmt.run(n, v));
         stmt.finalize();
-        
+
         resolve(db);
       });
     });
   }
 
-  // Insert tiles into MBTiles database
-  insertTilesIntoDatabase(db, tiles) {
-    return new Promise((resolve, reject) => {
+  async insertTilesBatch(db, successfulTiles) {
+    if (successfulTiles.length === 0) return 0;
+
+    return new Promise((resolve) => {
       const stmt = db.prepare(`
         INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data)
         VALUES (?, ?, ?, ?)
       `);
-      
+
       let inserted = 0;
-      const total = tiles.length;
-      
-      tiles.forEach((tile, index) => {
-        // In MBTiles, tile_row is calculated as (2^zoom - 1 - y)
+      const total = successfulTiles.length;
+
+      successfulTiles.forEach((tile) => {
         const tile_row = Math.pow(2, tile.z) - 1 - tile.y;
-        
         stmt.run(tile.z, tile.x, tile_row, tile.data, (err) => {
-          if (err) {
-            console.error(`Failed to insert tile ${tile.z}/${tile.x}/${tile.y}: ${err.message}`);
-          } else {
-            inserted++;
-          }
-          
+          if (err)
+            console.error(
+              `Insert error z${tile.z}/${tile.x}/${tile.y}: ${err.message}`,
+            );
+          else inserted++;
+
           if (inserted === total) {
             stmt.finalize();
-            db.close();
             resolve(inserted);
           }
         });
       });
-      
-      if (tiles.length === 0) {
-        db.close();
-        resolve(0);
-      }
     });
   }
 
-  // Main download process
+  getMemoryUsage() {
+    const used = process.memoryUsage();
+    return {
+      rssMB: (used.rss / 1024 / 1024).toFixed(1),
+      heapUsedMB: (used.heapUsed / 1024 / 1024).toFixed(1),
+      heapTotalMB: (used.heapTotal / 1024 / 1024).toFixed(1),
+    };
+  }
+
   async download() {
-    console.log('Calculating tile coordinates...');
-    const tiles = this.getTileCoordinates();
-    console.log(`Found ${tiles.length} tiles to download`);
-    
-    console.log('Creating MBTiles database...');
+    console.log("Starting memory-friendly tile download...");
+    console.log(
+      `Batch size: ${this.batchSize}  |  Concurrency: ${this.concurrency}\n`,
+    );
+
     const db = await this.createMBTilesDatabase();
-    
-    console.log(`Downloading tiles with ${this.concurrency} concurrent threads...`);
-    const downloadedTiles = await this.downloadTiles(tiles);
-    
-    console.log(`Successfully downloaded ${downloadedTiles.length} tiles`);
-    
-    console.log('Inserting tiles into database...');
-    const insertedCount = await this.insertTilesIntoDatabase(db, downloadedTiles);
-    
-    console.log(`Successfully inserted ${insertedCount} tiles into ${this.outputFile}`);
+    let grandTotalTiles = 0;
+    let grandTotalSuccess = 0;
+
+    for (let zoom = 0; zoom <= this.maxZoom; zoom++) {
+      console.log(
+        `\n┌── Zoom ${zoom.toString().padStart(2)} ───────────────────────────────`,
+      );
+
+      const tl = this.deg2num(this.topLeft.lat, this.topLeft.lng, zoom);
+      const br = this.deg2num(this.bottomRight.lat, this.bottomRight.lng, zoom);
+
+      const minX = Math.min(tl.x, br.x),
+        maxX = Math.max(tl.x, br.x);
+      const minY = Math.min(tl.y, br.y),
+        maxY = Math.max(tl.y, br.y);
+
+      const tilesThisZoom = [];
+      for (let x = minX; x <= maxX; x++) {
+        for (let y = minY; y <= maxY; y++) {
+          tilesThisZoom.push({ z: zoom, x, y });
+        }
+      }
+
+      let remainingFailed = []; // 该 zoom 层累计失败的（跨批次）
+
+      for (let i = 0; i < tilesThisZoom.length; i += this.batchSize) {
+        const batchStartTime = Date.now();
+
+        const batch = tilesThisZoom.slice(i, i + this.batchSize);
+        const batchIndex = Math.floor(i / this.batchSize) + 1;
+        const batchTotal = Math.ceil(tilesThisZoom.length / this.batchSize);
+
+        console.log(
+          `│  Batch ${batchIndex}/${batchTotal} (${batch.length} tiles)`,
+        );
+
+        let { successful, failed } = await this.downloadTiles(
+          batch,
+          batchIndex,
+          batchTotal,
+        );
+
+        // 立即把本批失败的加入层级失败队列
+        remainingFailed.push(...failed);
+
+        // 本批下载的数据量统计（不变）
+        let downloadedBytes = successful.reduce(
+          (sum, r) => sum + (r.data?.length || 0),
+          0,
+        );
+        const downloadedMB = (downloadedBytes / 1024 / 1024).toFixed(2);
+
+        // 插入成功的
+        let inserted = 0;
+        if (successful.length > 0) {
+          inserted = await this.insertTilesBatch(db, successful);
+        }
+
+        // ─────────────── 立即重试本批失败的 ───────────────
+        let retrySuccess = 0;
+        if (failed.length > 0) {
+          const retryResult = await this.retryFailedTiles(failed);
+          if (retryResult.successful.length > 0) {
+            retrySuccess = await this.insertTilesBatch(
+              db,
+              retryResult.successful,
+            );
+            console.log(
+              `  Retry success: ${retrySuccess}/${retryResult.successful.length}`,
+            );
+          }
+          // 更新 remainingFailed，只保留最终仍失败的
+          remainingFailed = remainingFailed.filter(
+            (t) =>
+              !retryResult.successful.some(
+                (s) => s.x === t.x && s.y === t.y && s.z === t.z,
+              ),
+          );
+        }
+
+        // 时间、内存统计（不变）
+        const durationSec = ((Date.now() - batchStartTime) / 1000).toFixed(1);
+        const memAfter = this.getMemoryUsage();
+
+        console.log(
+          `│    ↓  ${inserted + retrySuccess}/${batch.length} saved  |  ${downloadedMB} MB`,
+        );
+        console.log(
+          `│    Time: ${durationSec}s  |  Memory: ${memAfter.heapUsedMB} MB`,
+        );
+
+        grandTotalSuccess += inserted + retrySuccess;
+      }
+
+      // ─────────────── zoom 层结束时，最后检查仍有失败的 ───────────────
+      if (remainingFailed.length > 0) {
+        console.log(
+          `\nZoom ${zoom} final retry for ${remainingFailed.length} persistent failures...`,
+        );
+        const finalRetry = await this.retryFailedTiles(remainingFailed);
+        if (finalRetry.successful.length > 0) {
+          const extraInserted = await this.insertTilesBatch(
+            db,
+            finalRetry.successful,
+          );
+          grandTotalSuccess += extraInserted;
+          console.log(`  Final retry saved: ${extraInserted}`);
+        }
+      }
+
+      console.log("└───────────────────────────────────────────────");
+    }
+
+    db.close();
+
+    const memAfterAll = this.getMemoryUsage();
+    console.log("\nDownload completed.");
+    console.log(`Total tiles processed : ${grandTotalTiles.toLocaleString()}`);
+    console.log(
+      `Successfully saved    : ${grandTotalSuccess.toLocaleString()}`,
+    );
+    console.log(
+      `Final memory usage    : ${memAfterAll.heapUsedMB} MB (RSS: ${memAfterAll.rssMB} MB)`,
+    );
+    console.log(`Output → ${this.outputFile}`);
   }
 }
+
+// ────────────────────────────────────────────────
+// MBTiles → Image 渲染部分（保持不变，略微精简格式）
+// ────────────────────────────────────────────────
 
 class MBTilesTester {
   constructor(inputFile, outputFile) {
@@ -205,209 +356,142 @@ class MBTilesTester {
     this.outputFile = outputFile;
   }
 
-  // Get the maximum zoom level from the database
   async getMaxZoomLevel() {
-    return new Promise((resolve, reject) => {
+    return new Promise((r, e) => {
       const db = new sqlite3.Database(this.inputFile);
-      
-      db.get('SELECT MAX(zoom_level) as max_zoom FROM tiles', (err, row) => {
+      db.get("SELECT MAX(zoom_level) as mz FROM tiles", (err, row) => {
         db.close();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(row.max_zoom || 0);
-        }
+        err ? e(err) : r(row?.mz || 0);
       });
     });
   }
 
-  // Get all tiles for a specific zoom level
-  async getTilesForZoom(zoomLevel) {
-    return new Promise((resolve, reject) => {
+  async getTilesForZoom(z) {
+    return new Promise((r, e) => {
       const db = new sqlite3.Database(this.inputFile);
-      
-      db.all(`
-        SELECT zoom_level, tile_column, tile_row, tile_data 
-        FROM tiles 
-        WHERE zoom_level = ? 
-        ORDER BY tile_column, tile_row
-      `, [zoomLevel], (err, rows) => {
-        db.close();
-        if (err) {
-          reject(err);
-        } else {
-          resolve(rows);
-        }
-      });
+      db.all(
+        "SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level = ? ORDER BY tile_column, tile_row",
+        [z],
+        (err, rows) => {
+          db.close();
+          err ? e(err) : r(rows);
+        },
+      );
     });
   }
 
-  // Convert MBTiles row to standard tile y coordinate
-  mbtilesRowToY(tile_row, zoomLevel) {
-    return Math.pow(2, zoomLevel) - 1 - tile_row;
+  mbRowToY(row, zoom) {
+    return Math.pow(2, zoom) - 1 - row;
   }
 
-  // Render image from tiles
   async renderImage() {
-    console.log(`Reading MBTiles database: ${this.inputFile}`);
-    
-    // Get the maximum zoom level
-    const maxZoom = await this.getMaxZoomLevel();
-    console.log(`Maximum zoom level found: ${maxZoom}`);
-    
-    if (maxZoom === 0) {
-      throw new Error('No tiles found in the database');
-    }
+    console.log(`Reading ${this.inputFile}`);
 
-    // Get tiles for the maximum zoom level
-    const tiles = await this.getTilesForZoom(maxZoom);
-    console.log(`Found ${tiles.length} tiles at zoom level ${maxZoom}`);
-    
-    if (tiles.length === 0) {
-      throw new Error(`No tiles found at zoom level ${maxZoom}`);
-    }
+    const maxZ = await this.getMaxZoomLevel();
+    if (maxZ === 0) throw new Error("No tiles found");
 
-    // Calculate image dimensions
-    const tileSize = 256; // Standard tile size
-    const minX = Math.min(...tiles.map(t => t.tile_column));
-    const maxX = Math.max(...tiles.map(t => t.tile_column));
-    const minY = Math.min(...tiles.map(t => this.mbtilesRowToY(t.tile_row, maxZoom)));
-    const maxY = Math.max(...tiles.map(t => this.mbtilesRowToY(t.tile_row, maxZoom)));
-    
-    const imageWidth = (maxX - minX + 1) * tileSize;
-    const imageHeight = (maxY - minY + 1) * tileSize;
-    
-    console.log(`Image dimensions: ${imageWidth}x${imageHeight}`);
-    console.log(`Tile range: X[${minX}-${maxX}], Y[${minY}-${maxY}]`);
+    const tiles = await this.getTilesForZoom(maxZ);
+    if (tiles.length === 0) throw new Error(`No tiles at zoom ${maxZ}`);
 
-    // Create base image with gray background
-    const baseImage = new Jimp(imageWidth, imageHeight, 0xf0f0f0ff);
+    const ts = 256;
+    const xs = tiles.map((t) => t.tile_column);
+    const ys = tiles.map((t) => this.mbRowToY(t.tile_row, maxZ));
+    const w = (Math.max(...xs) - Math.min(...xs) + 1) * ts;
+    const h = (Math.max(...ys) - Math.min(...ys) + 1) * ts;
 
-    // Draw each tile
-    let drawnTiles = 0;
-    
-    for (const tile of tiles) {
-      const x = (tile.tile_column - minX) * tileSize;
-      const y = (this.mbtilesRowToY(tile.tile_row, maxZoom) - minY) * tileSize;
-      
+    console.log(`Rendering z${maxZ} → ${w}×${h}  (${tiles.length} tiles)`);
+
+    const img = new Jimp(w, h, 0xf0f0f0ff);
+    let drawn = 0;
+
+    for (const t of tiles) {
+      const x = (t.tile_column - Math.min(...xs)) * ts;
+      const y = (this.mbRowToY(t.tile_row, maxZ) - Math.min(...ys)) * ts;
       try {
-        // Load tile image from blob data
-        const tileImage = await Jimp.read(Buffer.from(tile.tile_data));
-        
-        // Composite the tile onto the base image
-        baseImage.composite(tileImage, x, y);
-        drawnTiles++;
-        
-        // Progress indicator
-        process.stdout.write(`\rDrawing tiles: ${drawnTiles}/${tiles.length}`);
-      } catch (error) {
-        console.error(`\nFailed to draw tile ${tile.tile_column}/${tile.tile_row}: ${error.message}`);
-      }
+        const tileImg = await Jimp.read(Buffer.from(t.tile_data));
+        img.composite(tileImg, x, y);
+        drawn++;
+        process.stdout.write(`\rDrawn ${drawn}/${tiles.length}`);
+      } catch {}
     }
-    
-    process.stdout.write('\n');
+    process.stdout.write("\n");
 
-    // Save the image
-    const outputPath = path.resolve(this.outputFile);
-    const outputDir = path.dirname(outputPath);
-    
-    // Ensure output directory exists
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true });
-    }
+    const out = path.resolve(this.outputFile);
+    fs.mkdirSync(path.dirname(out), { recursive: true });
 
-    // Determine output format from file extension
-    const ext = path.extname(this.outputFile).toLowerCase();
-    
-    if (ext === '.png') {
-      await baseImage.writeAsync(outputPath);
-    } else if (ext === '.jpg' || ext === '.jpeg') {
-      await baseImage.quality(90).writeAsync(outputPath);
-    } else {
-      // Default to PNG
-      await baseImage.writeAsync(outputPath);
-    }
+    const ext = path.extname(out).toLowerCase();
+    if (ext === ".jpg" || ext === ".jpeg")
+      await img.quality(85).writeAsync(out);
+    else await img.writeAsync(out);
 
-    console.log(`Image saved to: ${outputPath}`);
-    console.log(`Successfully drew ${drawnTiles} tiles`);
+    console.log(`Saved → ${out}`);
   }
 }
 
-// CLI setup
-program
-  .name('2maps-loader')
-  .description('CLI tool for downloading raster map tiles to MBTiles format')
-  .version('1.0.0');
+// ────────────────────────────────────────────────
+// CLI
+// ────────────────────────────────────────────────
 
-// Test command to render image from MBTiles
 program
-  .command('test')
-  .description('Render an image from MBTiles database')
-  .requiredOption('--input <file>', 'Input MBTiles file path')
-  .requiredOption('--output <file>', 'Output image file path')
-  .action(async (options) => {
+  .name("2maps-loader")
+  .description("Download raster tiles → MBTiles (with batch stats)")
+  .version("1.2.0");
+
+program
+  .command("download")
+  .requiredOption("--corner1 <lat,lng>")
+  .requiredOption("--corner2 <lat,lng>")
+  .requiredOption("--max-zoom <number>", "Max zoom", Number)
+  .requiredOption("--url-template <url>")
+  .requiredOption("--output <file>")
+  .option("--concurrency <n>", Number, 5)
+  .option("--batch-size <n>", Number, 1000)
+  .action(async (opts) => {
     try {
-      const tester = new MBTilesTester(options.input, options.output);
-      await tester.renderImage();
-    } catch (error) {
-      console.error('Error:', error.message);
+      const c1 = parseCoords(opts.corner1);
+      const c2 = parseCoords(opts.corner2);
+
+      const downloader = new TileDownloader({
+        topLeft: {
+          lat: Math.max(c1.lat, c2.lat),
+          lng: Math.min(c1.lng, c2.lng),
+        },
+        bottomRight: {
+          lat: Math.min(c1.lat, c2.lat),
+          lng: Math.max(c1.lng, c2.lng),
+        },
+        maxZoom: opts.maxZoom,
+        urlTemplate: opts.urlTemplate,
+        outputFile: opts.output,
+        concurrency: opts.concurrency,
+        batchSize: opts.batchSize,
+      });
+
+      await downloader.download();
+    } catch (e) {
+      console.error("Error:", e.message);
       process.exit(1);
     }
   });
 
-// Download command
 program
-  .command('download')
-  .description('Download map tiles to MBTiles format (supports any 2 box corners)')
-  .requiredOption('--corner1 <coords>', 'First corner coordinates in format "lat,lng"')
-  .requiredOption('--corner2 <coords>', 'Second corner coordinates in format "lat,lng"')
-  .requiredOption('--max-zoom <number>', 'Maximum zoom level', parseInt)
-  .requiredOption('--url-template <template>', 'URL template for tiles (use {z}, {x}, {y} placeholders)')
-  .requiredOption('--output <file>', 'Output MBTiles file path')
-  .option('--concurrency <number>', 'Number of concurrent downloads (default: 5)', parseInt, 5)
-  .action(async (options) => {
+  .command("test")
+  .requiredOption("--input <file>")
+  .requiredOption("--output <file>")
+  .action(async (opts) => {
     try {
-      // Parse two corners
-      const corners = [
-        parseCoordinates(options.corner1),
-        parseCoordinates(options.corner2)
-      ];
-
-      // Calculate bounding box
-      const lats = corners.map(c => c.lat);
-      const lngs = corners.map(c => c.lng);
-      const minLat = Math.min(...lats);
-      const maxLat = Math.max(...lats);
-      const minLng = Math.min(...lngs);
-      const maxLng = Math.max(...lngs);
-
-      // Use min/max for bounding box
-      const topLeft = { lat: maxLat, lng: minLng };
-      const bottomRight = { lat: minLat, lng: maxLng };
-
-      const downloader = new TileDownloader({
-        topLeft,
-        bottomRight,
-        maxZoom: options.maxZoom,
-        urlTemplate: options.urlTemplate,
-        outputFile: options.output,
-        concurrency: options.concurrency
-      });
-
-      await downloader.download();
-    } catch (error) {
-      console.error('Error:', error.message);
+      const tester = new MBTilesTester(opts.input, opts.output);
+      await tester.renderImage();
+    } catch (e) {
+      console.error("Error:", e.message);
       process.exit(1);
     }
   });
 
 program.parse();
 
-// Parse coordinates
-function parseCoordinates(coordsStr) {
-  const [lat, lng] = coordsStr.split(',').map(Number);
-  if (isNaN(lat) || isNaN(lng)) {
-    throw new Error(`Invalid coordinates format: ${coordsStr}. Expected "lat,lng"`);
-  }
+function parseCoords(s) {
+  const [lat, lng] = s.split(",").map(Number);
+  if (isNaN(lat) || isNaN(lng)) throw new Error(`Invalid: ${s}`);
   return { lat, lng };
 }
