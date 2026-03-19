@@ -172,30 +172,37 @@ class TileDownloader {
     });
   }
 
-  async insertTilesBatch(db, successfulTiles) {
-    if (successfulTiles.length === 0) return 0;
+  async insertTilesBatch(db, tiles) {
+    if (!tiles.length) return 0;
 
-    return new Promise((resolve) => {
-      const stmt = db.prepare(`
-        INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data)
-        VALUES (?, ?, ?, ?)
-      `);
+    return new Promise((resolve, reject) => {
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION");
 
-      let inserted = 0;
-      const total = successfulTiles.length;
+        const stmt = db.prepare(
+          "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+        );
 
-      successfulTiles.forEach((tile) => {
-        const tile_row = Math.pow(2, tile.z) - 1 - tile.y;
-        stmt.run(tile.z, tile.x, tile_row, tile.data, (err) => {
-          if (err)
-            console.error(
-              `Insert error z${tile.z}/${tile.x}/${tile.y}: ${err.message}`,
-            );
-          else inserted++;
+        let inserted = 0;
+        let hasError = false;
 
-          if (inserted === total) {
-            stmt.finalize();
-            resolve(inserted);
+        tiles.forEach((tile) => {
+          const tile_row = Math.pow(2, tile.z) - 1 - tile.y;
+          stmt.run(tile.z, tile.x, tile_row, tile.data, (err) => {
+            if (err) {
+              console.error(err.message);
+              hasError = true;
+            } else {
+              inserted++;
+            }
+          });
+        });
+
+        stmt.finalize(() => {
+          if (hasError) {
+            db.run("ROLLBACK", () => reject(new Error("Batch insert failed")));
+          } else {
+            db.run("COMMIT", () => resolve(inserted));
           }
         });
       });
@@ -318,8 +325,12 @@ class TileDownloader {
         let inserted = 0;
         if (successful.length > 0) {
           inserted = await this.insertTilesBatch(db, successful);
+          // 立即释放 Buffer，降低峰值内存
+          successful.forEach((t) => {
+            t.data = null;
+          });
+          successful.length = 0; // 可选，进一步帮助 GC
         }
-
         // ─────────────── 立即重试本批失败的 ───────────────
         let retrySuccess = 0;
         if (failed.length > 0) {
@@ -329,6 +340,10 @@ class TileDownloader {
               db,
               retryResult.successful,
             );
+            retryResult.successful.forEach((t) => {
+              t.data = null;
+            });
+            retryResult.successful.length = 0;
             console.log(
               `  Retry success: ${retrySuccess}/${retryResult.successful.length}`,
             );
@@ -367,6 +382,9 @@ class TileDownloader {
             db,
             finalRetry.successful,
           );
+          finalRetry.successful.forEach((t) => {
+            t.data = null;
+          });
           grandTotalSuccess += extraInserted;
           console.log(`  Final retry saved: ${extraInserted}`);
         }
