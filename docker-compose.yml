@@ -12,5 +12,5 @@ services:
     - NODE_ENV=production
     command: >
       sh -c "
-        node index.js download --corner1 3.397161870,73.502355000 --corner2 53.563269000,135.095670000 --max-zoom 9 --url-template http://192.168.1.68:8080/tile/{z}/{x}/{y}.png --output D:\\china.mbtiles
+        node index.js download --convert-pmtiles --corner1 3.397161870,73.502355000 --corner2 53.563269000,135.095670000 --max-zoom 8 --url-template http://192.168.1.68:8080/tile/{z}/{x}/{y}.png --output /app/output/china.mbtiles
       "

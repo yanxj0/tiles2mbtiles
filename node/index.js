@@ -6,6 +6,7 @@ const axios = require("axios");
 const path = require("path");
 const fs = require("fs");
 const Jimp = require("jimp");
+const { spawn } = require("child_process");
 
 class TileDownloader {
   constructor(options) {
@@ -18,6 +19,8 @@ class TileDownloader {
     this.batchSize = options.batchSize || 1000;
     this.retryLimit = 3; // 每个瓦片最多重试几次
     this.progressInterval = 50; // 每下载多少个更新一次进度条
+    this.convertToPMTiles = options.convertToPMTiles || false;
+    this.pmtilesPath = options.pmtilesPath || path.join(__dirname, "pmtiles");
   }
 
   deg2num(lat_deg, lon_deg, zoom) {
@@ -405,6 +408,53 @@ class TileDownloader {
       `Final memory usage    : ${memAfterAll.heapUsedMB} MB (RSS: ${memAfterAll.rssMB} MB)`,
     );
     console.log(`Output → ${this.outputFile}`);
+
+    // ──────────────── 自动转换为 PMTiles（可选） ────────────────
+    if (this.convertToPMTiles) {
+      await this.tryConvertToPMTiles();
+    } else {
+      console.log("\nTip: You can convert to PMTiles later using:");
+      console.log(
+        `  pmtiles convert "${this.outputFile}" "${this.outputFile.replace(/\.mbtiles$/i, ".pmtiles")}"`,
+      );
+    }
+  }
+  // 转换成PMTiles
+  async tryConvertToPMTiles() {
+    const outputPmtiles = this.outputFile.replace(/\.mbtiles$/i, ".pmtiles");
+    let pmtilesExecutable = this.pmtilesPath;
+    if (!fs.existsSync(pmtilesExecutable)) {
+      pmtilesExecutable = "pmtiles";
+    }
+
+    return new Promise((resolve, reject) => {
+      console.log(`\nStarting stream conversion: ${outputPmtiles}`);
+
+      // 使用 spawn 替代 exec，不占用 Node.js 内存 Buffer
+      const child = spawn(pmtilesExecutable, [
+        "convert",
+        this.outputFile,
+        outputPmtiles,
+      ]);
+
+      child.stdout.on("data", (data) =>
+        process.stdout.write(`pmtiles: ${data}`),
+      );
+      child.stderr.on("data", (data) =>
+        process.stderr.write(`pmtiles_err: ${data}`),
+      );
+
+      child.on("close", (code) => {
+        if (code === 0) {
+          console.log("\nConversion successful!");
+          resolve();
+        } else {
+          reject(new Error(`pmtiles process exited with code ${code}`));
+        }
+      });
+
+      child.on("error", (err) => reject(err));
+    });
   }
 }
 
@@ -508,6 +558,15 @@ program
   .requiredOption("--output <file>")
   .option("--concurrency <n>", Number, 5)
   .option("--batch-size <n>", Number, 1000)
+  .option(
+    "--convert-pmtiles",
+    "Automatically convert output to PMTiles format after download",
+  )
+  .option(
+    "--pmtiles-path <path>",
+    "Path to pmtiles executable (default: same directory)",
+    path.join(__dirname, "pmtiles"),
+  )
   .action(async (opts) => {
     try {
       const c1 = parseCoords(opts.corner1);
@@ -527,6 +586,8 @@ program
         outputFile: opts.output,
         concurrency: opts.concurrency,
         batchSize: opts.batchSize,
+        convertToPMTiles: opts.convertPmtiles,
+        pmtilesPath: opts.pmtilesPath,
       });
 
       await downloader.download();
