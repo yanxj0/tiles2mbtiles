@@ -10,6 +10,14 @@ CLI tool for downloading raster map tiles to MBTiles format.
 - Output in MBTiles format (SQLite database)
 - Progress tracking
 
+## Use with docker
+
+Modify the docker-compose.yml file and run 
+
+```bash
+docker-compose up -d
+```
+
 ## Installation
 
 ```bash
@@ -40,6 +48,9 @@ node index.js download --corner1 "55.7558,37.6173" \
 - `--url-template`: URL template for tiles with {z}, {x}, {y} placeholders
 - `--output`: Output MBTiles file path
 - `--concurrency`: Number of concurrent downloads (default: 5)
+- `--batch-size`: Single batch downloads count (default: 1000)
+- `--convert-pmtiles`: Automatically convert output to PMTiles format after download
+- `--pmtiles-path <path>`: Path to pmtiles executable (default: same directory)
 
 ### Test Command
 
