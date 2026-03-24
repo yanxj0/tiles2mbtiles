@@ -16,6 +16,9 @@ Modify the docker-compose.yml file and run
 
 ```bash
 docker-compose up -d
+
+# expor
+docker save tiles2mbtiles:latest | xz -z > ./tiles2mbtiles.tar.xz
 ```
 
 ## Installation

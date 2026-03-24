@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "download": "node index.js download --corner1 26.3543,102.7921 --corner2 33.3081,115.7981 --max-zoom 10 --url-template http://192.168.1.68:8080/tile/{z}/{x}/{y}.png --output d:\\global.mbtiles"
+    "download": "node index.js download --corner1 26.3543,102.7921 --corner2 33.3081,115.7981 --max-zoom 13 --url-template http://192.168.1.68:8080/tile/{z}/{x}/{y}.png --output d:\\global.mbtiles"
   },
   "keywords": ["maps", "tiles", "mbtiles", "cli", "download"],
   "author": "",
@@ -17,7 +17,8 @@
     "commander": "^11.1.0",
     "sqlite3": "^5.1.6",
     "axios": "^1.5.0",
-    "jimp": "^0.22.10"
+    "jimp": "^0.22.10",
+    "@turf/turf": "^7.3.4"
   },
   "engines": {
     "node": ">=14.0.0"

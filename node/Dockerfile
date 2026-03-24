@@ -16,10 +16,10 @@ WORKDIR /app
 COPY package*.json ./
 
 # 安装依赖
-RUN npm ci
+RUN npm install --production
 
 # 复制源码
 COPY . .
 
-# 启动命令
-CMD ["npm", "start"]
+# 启动命令增加 --expose-gc 参数 
+CMD ["node", "--max-old-space-size=8192", "--expose-gc", "index.js", "download"]

@@ -6,11 +6,22 @@ services:
       context: ./node
       dockerfile: Dockerfile
     image: tiles2mbtiles:latest
+    # 建议添加内存限制，防止 Node.js 进程意外耗尽宿主机资源 [cite: 1]
+    deploy:
+      resources:
+        limits:
+          memory: 6G 
     volumes:
       - ./output:/app/output
     environment:
-    - NODE_ENV=production
+      - NODE_ENV=production
+    # 关键修改：增加 --expose-gc 和 --max-old-space-size 
     command: >
-      sh -c "
-        node index.js download --convert-pmtiles --corner1 3.397161870,73.502355000 --corner2 53.563269000,135.095670000 --max-zoom 8 --url-template http://192.168.1.68:8080/tile/{z}/{x}/{y}.png --output /app/output/china.mbtiles
-      "
+      node --max-old-space-size=8192 --expose-gc index.js download 
+        --convert-pmtiles 
+        --corner1 3.397161870,73.502355000 
+        --corner2 53.563269000,135.095670000
+        --min-zoom 2 
+        --max-zoom 8 
+        --url-template http://192.168.1.68:8080/tile/{z}/{x}/{y}.png 
+        --output /app/output/china.mbtiles

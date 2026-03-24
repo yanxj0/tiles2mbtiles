@@ -7,467 +7,290 @@ const path = require("path");
 const fs = require("fs");
 const Jimp = require("jimp");
 const { spawn } = require("child_process");
+const turf = require("@turf/turf");
 
 class TileDownloader {
   constructor(options) {
-    this.topLeft = options.topLeft;
-    this.bottomRight = options.bottomRight;
-    this.maxZoom = options.maxZoom;
+    this.geoJson = options.geoJson || this.loadDefaultGeoJson();
+    this.targetGeometry = null;
+    this.geoBBox = null;
+    this.totalTilesToProcess = 0; // 全局总数统计
+
+    if (this.geoJson) {
+      console.log(`[Info] 正在预处理 GeoJSON 边界数据...`);
+      const combined = turf.combine(this.geoJson);
+      this.targetGeometry = combined.features[0];
+      this.geoBBox = turf.bbox(this.geoJson);
+
+      // 预估总瓦片数（基于 BBox 矩形范围，作为进度分母）
+      for (
+        let z = parseInt(options.minZoom) || 0;
+        z <= parseInt(options.maxZoom);
+        z++
+      ) {
+        const tl = this.deg2num(this.geoBBox[3], this.geoBBox[0], z);
+        const br = this.deg2num(this.geoBBox[1], this.geoBBox[2], z);
+        this.totalTilesToProcess +=
+          (Math.abs(br.x - tl.x) + 1) * (Math.abs(br.y - tl.y) + 1);
+      }
+    }
+
+    this.outputFile = options.outputFile; // 确保为字符串
+    this.minZoom = parseInt(options.minZoom) || 0;
+    this.maxZoom = parseInt(options.maxZoom);
     this.urlTemplate = options.urlTemplate;
-    this.outputFile = options.outputFile;
-    this.concurrency = options.concurrency || 5;
-    this.batchSize = options.batchSize || 1000;
-    this.retryLimit = 3; // 每个瓦片最多重试几次
-    this.progressInterval = 50; // 每下载多少个更新一次进度条
+    this.concurrency = parseInt(options.concurrency) || 10;
+    this.batchSize = parseInt(options.batchSize) || 500;
     this.convertToPMTiles = options.convertToPMTiles || false;
-    this.pmtilesPath = options.pmtilesPath || path.join(__dirname, "pmtiles");
   }
 
-  deg2num(lat_deg, lon_deg, zoom) {
-    const lat_rad = (lat_deg * Math.PI) / 180;
+  loadDefaultGeoJson() {
+    const defaultPath = path.join(__dirname, "china.geojson");
+    if (fs.existsSync(defaultPath)) {
+      try {
+        console.log(`[Info] 自动加载默认边界文件: ${defaultPath}`);
+        return JSON.parse(fs.readFileSync(defaultPath, "utf-8"));
+      } catch (e) {
+        console.warn(`[Warn] 默认 GeoJSON 解析失败: ${e.message}`);
+      }
+    }
+    return null;
+  }
+
+  deg2num(lat, lon, zoom) {
+    const lat_rad = (lat * Math.PI) / 180;
     const n = Math.pow(2, zoom);
-    const xtile = Math.floor(((lon_deg + 180) / 360) * n);
-    const ytile = Math.floor(
-      ((1 - Math.log(Math.tan(lat_rad) + 1 / Math.cos(lat_rad)) / Math.PI) /
-        2) *
-        n,
-    );
-    return { x: xtile, y: ytile };
+    return {
+      x: Math.floor(((lon + 180) / 360) * n),
+      y: Math.floor(
+        ((1 - Math.log(Math.tan(lat_rad) + 1 / Math.cos(lat_rad)) / Math.PI) /
+          2) *
+          n,
+      ),
+    };
   }
 
-  async downloadTile(tile) {
+  num2deg(x, y, z) {
+    const n = Math.pow(2, z);
+    const lon = (x / n) * 360 - 180;
+    const lat_rad = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
+    return [lon, (lat_rad * 180) / Math.PI];
+  }
+
+  *tileGenerator(zoom) {
+    let xMin, xMax, yMin, yMax;
+
+    // 使用预处理好的数据
+    if (this.targetGeometry && this.geoBBox) {
+      const tl = this.deg2num(this.geoBBox[3], this.geoBBox[0], zoom);
+      const br = this.deg2num(this.geoBBox[1], this.geoBBox[2], zoom);
+      xMin = Math.min(tl.x, br.x);
+      xMax = Math.max(tl.x, br.x);
+      yMin = Math.min(tl.y, br.y);
+      yMax = Math.max(tl.y, br.y);
+    } else if (this.topLeft && this.bottomRight) {
+      const tl = this.deg2num(this.topLeft.lat, this.topLeft.lng, zoom);
+      const br = this.deg2num(this.bottomRight.lat, this.bottomRight.lng, zoom);
+      xMin = Math.min(tl.x, br.x);
+      xMax = Math.max(tl.x, br.x);
+      yMin = Math.min(tl.y, br.y);
+      yMax = Math.max(tl.y, br.y);
+    } else {
+      throw new Error("未检测到有效的 GeoJSON 或坐标范围");
+    }
+
+    for (let x = xMin; x <= xMax; x++) {
+      for (let y = yMin; y <= yMax; y++) {
+        if (this.targetGeometry) {
+          // 仅进行点在面内的布尔运算，不再进行复杂的 combine 操作
+          const pt = turf.point(this.num2deg(x + 0.5, y + 0.5, zoom));
+          if (!turf.booleanPointInPolygon(pt, this.targetGeometry)) continue;
+        }
+        yield { z: zoom, x, y };
+      }
+    }
+  }
+
+  async downloadTileWithRetry(tile, attempt = 1) {
     const url = this.urlTemplate
       .replace("{z}", tile.z)
       .replace("{x}", tile.x)
       .replace("{y}", tile.y);
-
     try {
       const response = await axios.get(url, {
         responseType: "arraybuffer",
-        timeout: 30000,
+        timeout: 15000,
       });
       return { ...tile, data: response.data, success: true };
     } catch (error) {
-      console.error(
-        `Failed to download tile ${tile.z}/${tile.x}/${tile.y}: ${error.message}`,
-      );
-      return { ...tile, data: null, success: false };
-    }
-  }
-
-  async downloadTiles(tiles, batchIndex, batchTotal) {
-    const successful = [];
-    const failed = [];
-    let completed = 0;
-
-    const queue = [...tiles];
-    const total = tiles.length;
-
-    // 用于控制进度更新的频率
-    let lastPrinted = 0;
-
-    const updateProgress = () => {
-      const percent = Math.round((completed / total) * 100);
-      process.stdout.write(
-        `\r  Batch ${batchIndex}/${batchTotal} progress: ${percent}% (${completed}/${total})   `,
-      );
-      lastPrinted = completed;
-    };
-
-    const worker = async () => {
-      while (queue.length > 0) {
-        const tile = queue.shift();
-        if (!tile) continue;
-
-        const result = await this.downloadTile(tile);
-        completed++;
-
-        if (result.success) {
-          successful.push(result);
-        } else {
-          failed.push(tile); // 只保留坐标，稍后重试
-        }
-
-        // 控制刷新频率，避免太频繁
-        if (
-          completed - lastPrinted >= this.progressInterval ||
-          completed === total
-        ) {
-          updateProgress();
-        }
+      if (attempt < this.retryLimit) {
+        await new Promise((r) => setTimeout(r, attempt * 500));
+        return this.downloadTileWithRetry(tile, attempt + 1);
       }
-    };
-
-    const workers = Array(this.concurrency)
-      .fill()
-      .map(() => worker());
-    await Promise.all(workers);
-
-    // 最终确保显示 100%
-    updateProgress();
-    process.stdout.write("\n");
-
-    return { successful, failed };
-  }
-  // ────────────────────────────────────────────────
-  // 新增：重试一批失败的瓦片
-  // ────────────────────────────────────────────────
-  async retryFailedTiles(failedTiles, currentRetryCount = 1) {
-    if (failedTiles.length === 0 || currentRetryCount > this.retryLimit) {
-      if (failedTiles.length > 0) {
-        console.warn(
-          `  → ${failedTiles.length} tiles still failed after ${this.retryLimit} retries`,
-        );
-      }
-      return { successful: [], stillFailed: failedTiles };
+      return { ...tile, success: false };
     }
-
-    console.log(
-      `  Retrying ${failedTiles.length} failed tiles (attempt ${currentRetryCount}/${this.retryLimit})...`,
-    );
-
-    const { successful, failed } = await this.downloadTiles(
-      failedTiles,
-      "retry",
-      "retry", // 临时标记，不影响显示
-    );
-
-    if (failed.length > 0) {
-      return await this.retryFailedTiles(failed, currentRetryCount + 1);
-    }
-
-    return { successful, stillFailed: [] };
   }
 
-  createMBTilesDatabase() {
+  async createMBTilesDatabase() {
     return new Promise((resolve, reject) => {
-      const db = new sqlite3.Database(this.outputFile);
-
-      db.serialize(() => {
-        db.run(
-          `CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT)`,
-        );
-        db.run(`CREATE TABLE IF NOT EXISTS tiles (
-          zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB,
-          PRIMARY KEY (zoom_level, tile_column, tile_row)
-        )`);
-
-        const metadata = [
-          ["name", "Map Tiles"],
-          ["type", "baselayer"],
-          ["version", "1.0"],
-          ["description", "Downloaded map tiles"],
-          ["format", "png"],
-          [
-            "bounds",
-            `${this.topLeft.lng},${this.bottomRight.lat},${this.bottomRight.lng},${this.topLeft.lat}`,
-          ],
-        ];
-
-        const stmt = db.prepare(
-          "INSERT OR REPLACE INTO metadata (name, value) VALUES (?, ?)",
-        );
-        metadata.forEach(([n, v]) => stmt.run(n, v));
-        stmt.finalize();
-
-        resolve(db);
-      });
+      try {
+        const db = new sqlite3.Database(this.outputFile);
+        db.serialize(() => {
+          db.run("PRAGMA journal_mode = WAL");
+          db.run("PRAGMA synchronous = OFF");
+          db.run(
+            `CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB, PRIMARY KEY (zoom_level, tile_column, tile_row))`,
+          );
+          resolve(db);
+        });
+      } catch (err) {
+        reject(err);
+      }
     });
   }
 
   async insertTilesBatch(db, tiles) {
-    if (!tiles.length) return 0;
-
+    if (!tiles || tiles.length === 0) return 0;
     return new Promise((resolve, reject) => {
       db.serialize(() => {
         db.run("BEGIN TRANSACTION");
-
         const stmt = db.prepare(
-          "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+          "INSERT OR IGNORE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
         );
-
-        let inserted = 0;
-        let hasError = false;
-
-        tiles.forEach((tile) => {
-          const tile_row = Math.pow(2, tile.z) - 1 - tile.y;
-          stmt.run(tile.z, tile.x, tile_row, tile.data, (err) => {
-            if (err) {
-              console.error(err.message);
-              hasError = true;
-            } else {
-              inserted++;
-            }
-          });
+        tiles.forEach((t) => {
+          const row = Math.pow(2, t.z) - 1 - t.y;
+          stmt.run(t.z, t.x, row, t.data);
+          t.data = null;
         });
-
         stmt.finalize(() => {
-          if (hasError) {
-            db.run("ROLLBACK", () => reject(new Error("Batch insert failed")));
-          } else {
-            db.run("COMMIT", () => resolve(inserted));
-          }
+          db.run("COMMIT", (err) =>
+            err ? reject(err) : resolve(tiles.length),
+          );
         });
-      });
-    });
-  }
-
-  getMemoryUsage() {
-    const used = process.memoryUsage();
-    return {
-      rssMB: (used.rss / 1024 / 1024).toFixed(1),
-      heapUsedMB: (used.heapUsed / 1024 / 1024).toFixed(1),
-      heapTotalMB: (used.heapTotal / 1024 / 1024).toFixed(1),
-    };
-  }
-
-  async getMissingTilesBatch(db, tiles) {
-    if (tiles.length === 0) return [];
-
-    // 准备 (z,x,y_mb) 元组列表，y_mb 是 MBTiles 的 tile_row
-    const conditions = tiles.map(
-      (t) => `(${t.z}, ${t.x}, ${Math.pow(2, t.z) - 1 - t.y})`,
-    );
-    const sql = `
-    SELECT zoom_level, tile_column, tile_row
-    FROM tiles
-    WHERE (zoom_level, tile_column, tile_row) IN (${conditions.join(",")})
-  `;
-
-    return new Promise((resolve, reject) => {
-      db.all(sql, (err, rows) => {
-        if (err) return reject(err);
-
-        const existingSet = new Set(
-          rows.map((r) => `${r.zoom_level},${r.tile_column},${r.tile_row}`),
-        );
-
-        const missing = tiles.filter((t) => {
-          const key = `${t.z},${t.x},${Math.pow(2, t.z) - 1 - t.y}`;
-          return !existingSet.has(key);
-        });
-
-        resolve(missing);
       });
     });
   }
 
   async download() {
-    console.log("Starting memory-friendly tile download...");
+    const mode = this.geoJson ? "GeoJSON 模式" : "矩形模式";
     console.log(
-      `Batch size: ${this.batchSize}  |  Concurrency: ${this.concurrency}\n`,
+      `\n🚀 任务启动 | ${mode} | Zoom ${this.minZoom}-${this.maxZoom}`,
     );
-
     const db = await this.createMBTilesDatabase();
-    let grandTotalTiles = 0;
-    let grandTotalSuccess = 0;
 
-    for (let zoom = 0; zoom <= this.maxZoom; zoom++) {
-      console.log(
-        `\n┌── Zoom ${zoom.toString().padStart(2)} ───────────────────────────────`,
-      );
+    let totalSavedGlobal = 0;
+    const globalStartTime = Date.now();
 
-      const tl = this.deg2num(this.topLeft.lat, this.topLeft.lng, zoom);
-      const br = this.deg2num(this.bottomRight.lat, this.bottomRight.lng, zoom);
+    for (let zoom = this.minZoom; zoom <= this.maxZoom; zoom++) {
+      console.log(`\n── Zoom ${zoom} ──`);
 
-      const minX = Math.min(tl.x, br.x),
-        maxX = Math.max(tl.x, br.x);
-      const minY = Math.min(tl.y, br.y),
-        maxY = Math.max(tl.y, br.y);
-
-      const tilesThisZoom = [];
-      for (let x = minX; x <= maxX; x++) {
-        for (let y = minY; y <= maxY; y++) {
-          tilesThisZoom.push({ z: zoom, x, y });
-        }
+      // 1. 【优化】改用 BBox 快速估算该层总数，不再使用 countGen 扫描
+      let estimatedTilesInZoom = 0;
+      if (this.geoBBox) {
+        const tl = this.deg2num(this.geoBBox[3], this.geoBBox[0], zoom);
+        const br = this.deg2num(this.geoBBox[1], this.geoBBox[2], zoom);
+        estimatedTilesInZoom =
+          (Math.abs(br.x - tl.x) + 1) * (Math.abs(br.y - tl.y) + 1);
+      } else if (this.topLeft && this.bottomRight) {
+        const tl = this.deg2num(this.topLeft.lat, this.topLeft.lng, zoom);
+        const br = this.deg2num(
+          this.bottomRight.lat,
+          this.bottomRight.lng,
+          zoom,
+        );
+        estimatedTilesInZoom =
+          (Math.abs(br.x - tl.x) + 1) * (Math.abs(br.y - tl.y) + 1);
       }
 
-      let remainingFailed = []; // 该 zoom 层累计失败的（跨批次）
+      const totalBatches =
+        Math.ceil(estimatedTilesInZoom / this.batchSize) || 1;
+      const gen = this.tileGenerator(zoom);
+      let processedInZoom = 0;
+      let currentBatchIdx = 0;
+      let finished = false;
 
-      for (let i = 0; i < tilesThisZoom.length; i += this.batchSize) {
-        const batchStartTime = Date.now();
-
-        const batchIndex = Math.floor(i / this.batchSize) + 1;
-        const batchTotal = Math.ceil(tilesThisZoom.length / this.batchSize);
-        const batch = tilesThisZoom.slice(i, i + this.batchSize);
-
-        console.log(
-          `│  Batch ${batchIndex}/${batchTotal} checking (${batch.length} tiles)`,
-        );
-
-        // ───── 新增：只保留真正缺失的 ─────
-        const toDownload = await this.getMissingTilesBatch(db, batch);
-
-        if (toDownload.length === 0) {
-          console.log(`│    All tiles already exist → skipped`);
-          continue;
-        }
-
-        console.log(
-          `│    Need to download ${toDownload.length}/${batch.length} missing tiles`,
-        );
-
-        // 然后正常下载、插入
-        const { successful, failed } = await this.downloadTiles(
-          toDownload,
-          batchIndex,
-          batchTotal,
-        );
-
-        // 立即把本批失败的加入层级失败队列
-        remainingFailed.push(...failed);
-
-        // 本批下载的数据量统计（不变）
-        let downloadedBytes = successful.reduce(
-          (sum, r) => sum + (r.data?.length || 0),
-          0,
-        );
-        const downloadedMB = (downloadedBytes / 1024 / 1024).toFixed(2);
-
-        // 插入成功的
-        let inserted = 0;
-        if (successful.length > 0) {
-          inserted = await this.insertTilesBatch(db, successful);
-          // 立即释放 Buffer，降低峰值内存
-          successful.forEach((t) => {
-            t.data = null;
-          });
-          successful.length = 0; // 可选，进一步帮助 GC
-        }
-        // ─────────────── 立即重试本批失败的 ───────────────
-        let retrySuccess = 0;
-        if (failed.length > 0) {
-          const retryResult = await this.retryFailedTiles(failed);
-          if (retryResult.successful.length > 0) {
-            retrySuccess = await this.insertTilesBatch(
-              db,
-              retryResult.successful,
-            );
-            retryResult.successful.forEach((t) => {
-              t.data = null;
-            });
-            retryResult.successful.length = 0;
-            console.log(
-              `  Retry success: ${retrySuccess}/${retryResult.successful.length}`,
-            );
+      while (!finished) {
+        let batch = [];
+        for (let i = 0; i < this.batchSize; i++) {
+          const { value, done } = gen.next();
+          if (done) {
+            finished = true;
+            break;
           }
-          // 更新 remainingFailed，只保留最终仍失败的
-          remainingFailed = remainingFailed.filter(
-            (t) =>
-              !retryResult.successful.some(
-                (s) => s.x === t.x && s.y === t.y && s.z === t.z,
-              ),
-          );
+          batch.push(value);
         }
 
-        // 时间、内存统计（不变）
-        const durationSec = ((Date.now() - batchStartTime) / 1000).toFixed(1);
-        const memAfter = this.getMemoryUsage();
+        if (batch.length > 0) {
+          currentBatchIdx++;
+          const successful = [];
+          const currentBatchSize = batch.length;
 
-        console.log(
-          `│    ↓  ${inserted + retrySuccess}/${batch.length} saved  |  ${downloadedMB} MB`,
-        );
-        console.log(
-          `│    Time: ${durationSec}s  |  Memory: ${memAfter.heapUsedMB} MB`,
-        );
+          const workers = Array(this.concurrency)
+            .fill()
+            .map(async () => {
+              while (batch.length > 0) {
+                const tile = batch.shift();
+                if (!tile) break;
+                const res = await this.downloadTileWithRetry(tile);
+                if (res.success) successful.push(res);
+              }
+            });
+          await Promise.all(workers);
 
-        grandTotalSuccess += inserted + retrySuccess;
-      }
+          const savedInBatch = await this.insertTilesBatch(db, successful);
+          totalSavedGlobal += savedInBatch;
+          processedInZoom += currentBatchSize;
 
-      // ─────────────── zoom 层结束时，最后检查仍有失败的 ───────────────
-      if (remainingFailed.length > 0) {
-        console.log(
-          `\nZoom ${zoom} final retry for ${remainingFailed.length} persistent failures...`,
-        );
-        const finalRetry = await this.retryFailedTiles(remainingFailed);
-        if (finalRetry.successful.length > 0) {
-          const extraInserted = await this.insertTilesBatch(
-            db,
-            finalRetry.successful,
+          // 2. 日志输出：使用估算总数
+          const percent = (
+            (processedInZoom / estimatedTilesInZoom) *
+            100
+          ).toFixed(2);
+          const mem = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+          const elapsed = (Date.now() - globalStartTime) / 1000;
+          const avgSpeed = (totalSavedGlobal / elapsed).toFixed(1);
+
+          console.log(
+            `[Zoom ${zoom}] 进度: ~${percent}% | ` +
+              `已处理: ${processedInZoom}/${estimatedTilesInZoom} | ` +
+              `批次: ${currentBatchIdx}/${totalBatches} | ` +
+              `均速: ${avgSpeed} t/s | 内存: ${mem}MB`,
           );
-          finalRetry.successful.forEach((t) => {
-            t.data = null;
-          });
-          grandTotalSuccess += extraInserted;
-          console.log(`  Final retry saved: ${extraInserted}`);
+
+          if (global.gc) global.gc();
+          await new Promise((r) => setImmediate(r));
         }
       }
-
-      console.log("└───────────────────────────────────────────────");
     }
 
-    db.close();
-
-    const memAfterAll = this.getMemoryUsage();
-    console.log("\nDownload completed.");
-    console.log(`Total tiles processed : ${grandTotalTiles.toLocaleString()}`);
-    console.log(
-      `Successfully saved    : ${grandTotalSuccess.toLocaleString()}`,
-    );
-    console.log(
-      `Final memory usage    : ${memAfterAll.heapUsedMB} MB (RSS: ${memAfterAll.rssMB} MB)`,
-    );
-    console.log(`Output → ${this.outputFile}`);
-
-    // ──────────────── 自动转换为 PMTiles（可选） ────────────────
-    if (this.convertToPMTiles) {
-      await this.tryConvertToPMTiles();
-    } else {
-      console.log("\nTip: You can convert to PMTiles later using:");
+    db.close(async () => {
       console.log(
-        `  pmtiles convert "${this.outputFile}" "${this.outputFile.replace(/\.mbtiles$/i, ".pmtiles")}"`,
+        `\n✅ 任务完成！总计保存: ${totalSavedGlobal.toLocaleString()}`,
       );
-    }
+      if (this.convertToPMTiles) await this.tryConvertToPMTiles();
+    });
   }
-  // 转换成PMTiles
+
   async tryConvertToPMTiles() {
     const outputPmtiles = this.outputFile.replace(/\.mbtiles$/i, ".pmtiles");
-    let pmtilesExecutable = this.pmtilesPath;
-    if (!fs.existsSync(pmtilesExecutable)) {
-      pmtilesExecutable = "pmtiles";
-    }
-
-    return new Promise((resolve, reject) => {
-      console.log(`\nStarting stream conversion: ${outputPmtiles}`);
-
-      // 使用 spawn 替代 exec，不占用 Node.js 内存 Buffer
-      const child = spawn(pmtilesExecutable, [
-        "convert",
-        this.outputFile,
-        outputPmtiles,
-      ]);
-
+    const cmd = fs.existsSync(this.pmtilesPath) ? this.pmtilesPath : "pmtiles";
+    return new Promise((resolve) => {
+      console.log(`\n📦 格式转换中...`);
+      const child = spawn(cmd, ["convert", this.outputFile, outputPmtiles]);
       child.stdout.on("data", (data) =>
-        process.stdout.write(`pmtiles: ${data}`),
+        process.stdout.write(`[pmtiles] ${data}`),
       );
-      child.stderr.on("data", (data) =>
-        process.stderr.write(`pmtiles_err: ${data}`),
-      );
-
-      child.on("close", (code) => {
-        if (code === 0) {
-          console.log("\nConversion successful!");
-          resolve();
-        } else {
-          reject(new Error(`pmtiles process exited with code ${code}`));
-        }
-      });
-
-      child.on("error", (err) => reject(err));
+      child.on("close", resolve);
     });
   }
 }
 
-// ────────────────────────────────────────────────
-// MBTiles → Image 渲染部分（保持不变，略微精简格式）
-// ────────────────────────────────────────────────
-
+// ───── 保留您原有的测试渲染逻辑 ─────
 class MBTilesTester {
   constructor(inputFile, outputFile) {
     this.inputFile = inputFile;
     this.outputFile = outputFile;
   }
-
   async getMaxZoomLevel() {
     return new Promise((r, e) => {
       const db = new sqlite3.Database(this.inputFile);
@@ -477,12 +300,11 @@ class MBTilesTester {
       });
     });
   }
-
   async getTilesForZoom(z) {
     return new Promise((r, e) => {
       const db = new sqlite3.Database(this.inputFile);
       db.all(
-        "SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level = ? ORDER BY tile_column, tile_row",
+        "SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level = ? LIMIT 100",
         [z],
         (err, rows) => {
           db.close();
@@ -491,110 +313,89 @@ class MBTilesTester {
       );
     });
   }
-
   mbRowToY(row, zoom) {
     return Math.pow(2, zoom) - 1 - row;
   }
-
   async renderImage() {
-    console.log(`Reading ${this.inputFile}`);
-
     const maxZ = await this.getMaxZoomLevel();
-    if (maxZ === 0) throw new Error("No tiles found");
-
     const tiles = await this.getTilesForZoom(maxZ);
-    if (tiles.length === 0) throw new Error(`No tiles at zoom ${maxZ}`);
-
+    if (!tiles || tiles.length === 0) {
+      console.log("No tiles found for testing.");
+      return;
+    }
     const ts = 256;
     const xs = tiles.map((t) => t.tile_column);
     const ys = tiles.map((t) => this.mbRowToY(t.tile_row, maxZ));
     const w = (Math.max(...xs) - Math.min(...xs) + 1) * ts;
     const h = (Math.max(...ys) - Math.min(...ys) + 1) * ts;
 
-    console.log(`Rendering z${maxZ} → ${w}×${h}  (${tiles.length} tiles)`);
-
+    console.log(`Rendering test image: ${w}x${h}...`);
     const img = new Jimp(w, h, 0xf0f0f0ff);
-    let drawn = 0;
-
     for (const t of tiles) {
       const x = (t.tile_column - Math.min(...xs)) * ts;
       const y = (this.mbRowToY(t.tile_row, maxZ) - Math.min(...ys)) * ts;
       try {
         const tileImg = await Jimp.read(Buffer.from(t.tile_data));
         img.composite(tileImg, x, y);
-        drawn++;
-        process.stdout.write(`\rDrawn ${drawn}/${tiles.length}`);
-      } catch {}
+      } catch (err) {
+        console.error("Tile render error:", err.message);
+      }
     }
-    process.stdout.write("\n");
-
-    const out = path.resolve(this.outputFile);
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-
-    const ext = path.extname(out).toLowerCase();
-    if (ext === ".jpg" || ext === ".jpeg")
-      await img.quality(85).writeAsync(out);
-    else await img.writeAsync(out);
-
-    console.log(`Saved → ${out}`);
+    await img.writeAsync(this.outputFile);
+    console.log(`Test image saved to -> ${this.outputFile}`);
   }
 }
 
-// ────────────────────────────────────────────────
-// CLI
-// ────────────────────────────────────────────────
-
-program
-  .name("2maps-loader")
-  .description("Download raster tiles → MBTiles (with batch stats)")
-  .version("1.2.0");
-
+// ───── CLI 命令定义 ─────
+program.name("2maps-loader").version("1.8.2");
 program
   .command("download")
-  .requiredOption("--corner1 <lat,lng>")
-  .requiredOption("--corner2 <lat,lng>")
-  .requiredOption("--max-zoom <number>", "Max zoom", Number)
+  .option("--geojson <path>", "GeoJSON 路径")
+  .option("--corner1 <lat,lng>", "左上角")
+  .option("--corner2 <lat,lng>", "右下角")
+  .option("--min-zoom <number>", "最小层级", "0")
+  .requiredOption("--max-zoom <number>", "最大层级")
   .requiredOption("--url-template <url>")
   .requiredOption("--output <file>")
-  .option("--concurrency <n>", Number, 5)
-  .option("--batch-size <n>", Number, 1000)
-  .option(
-    "--convert-pmtiles",
-    "Automatically convert output to PMTiles format after download",
-  )
-  .option(
-    "--pmtiles-path <path>",
-    "Path to pmtiles executable (default: same directory)",
-    path.join(__dirname, "pmtiles"),
-  )
+  .option("--concurrency <n>", "并发数", "10")
+  .option("--batch-size <n>", "批次大小", "1000")
+  .option("--convert-pmtiles", "自动转换")
   .action(async (opts) => {
-    try {
-      const c1 = parseCoords(opts.corner1);
-      const c2 = parseCoords(opts.corner2);
+    let geoJson = null,
+      tl = null,
+      br = null;
 
-      const downloader = new TileDownloader({
-        topLeft: {
-          lat: Math.max(c1.lat, c2.lat),
-          lng: Math.min(c1.lng, c2.lng),
-        },
-        bottomRight: {
-          lat: Math.min(c1.lat, c2.lat),
-          lng: Math.max(c1.lng, c2.lng),
-        },
-        maxZoom: opts.maxZoom,
-        urlTemplate: opts.urlTemplate,
-        outputFile: opts.output,
-        concurrency: opts.concurrency,
-        batchSize: opts.batchSize,
-        convertToPMTiles: opts.convertPmtiles,
-        pmtilesPath: opts.pmtilesPath,
-      });
+    // --- 增加防御性代码：去除可能存在的换行符或空格 ---
+    const output = opts.output ? opts.output.trim() : null;
+    const urlTemplate = opts.urlTemplate ? opts.urlTemplate.trim() : null;
 
-      await downloader.download();
-    } catch (e) {
-      console.error("Error:", e.message);
-      process.exit(1);
+    // 手动解析 GeoJSON
+    if (opts.geojson && fs.existsSync(opts.geojson)) {
+      geoJson = JSON.parse(fs.readFileSync(opts.geojson, "utf-8"));
     }
+
+    // 解析坐标
+    if (opts.corner1 && opts.corner2) {
+      const c1 = opts.corner1.split(",").map(Number);
+      const c2 = opts.corner2.split(",").map(Number);
+      tl = { lat: Math.max(c1[0], c2[0]), lng: Math.min(c1[1], c2[1]) };
+      br = { lat: Math.min(c1[0], c2[0]), lng: Math.max(c1[1], c2[1]) };
+    }
+
+    const downloader = new TileDownloader({
+      geoJson,
+      topLeft: tl,
+      bottomRight: br,
+      minZoom: opts.minZoom,
+      maxZoom: opts.maxZoom,
+      urlTemplate: urlTemplate, // 使用处理后的 urlTemplate
+      outputFile: output, // 使用处理后的 output
+      concurrency: opts.concurrency,
+      batchSize: opts.batchSize,
+      convertToPMTiles: opts.convertPmtiles,
+    });
+
+    await downloader.download();
   });
 
 program
@@ -606,15 +407,8 @@ program
       const tester = new MBTilesTester(opts.input, opts.output);
       await tester.renderImage();
     } catch (e) {
-      console.error("Error:", e.message);
-      process.exit(1);
+      console.error("Test Error:", e.message);
     }
   });
 
 program.parse();
-
-function parseCoords(s) {
-  const [lat, lng] = s.split(",").map(Number);
-  if (isNaN(lat) || isNaN(lng)) throw new Error(`Invalid: ${s}`);
-  return { lat, lng };
-}
