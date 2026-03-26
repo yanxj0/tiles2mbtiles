@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "download": "node index.js download --corner1 26.3543,102.7921 --corner2 33.3081,115.7981 --max-zoom 13 --url-template http://192.168.1.68:8080/tile/{z}/{x}/{y}.png --output d:\\global.mbtiles"
+    "download": "node index.js download --corner1 -90,-180 --corner2 90,180 --max-zoom 6 --url-template http://localhost:801/natural_earth/{z}/{x}/{y}.png --output d:\\natural_earth.mbtiles"
   },
   "keywords": ["maps", "tiles", "mbtiles", "cli", "download"],
   "author": "",
