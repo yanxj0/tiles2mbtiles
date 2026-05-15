@@ -32,19 +32,33 @@ npm install
 
 ### Download Command
 
-Download map tiles to MBTiles format using any two box corners:
+Download map tiles to MBTiles format using any two box corners or geojson:
 
 ```bash
-node index.js download --corner1 "55.7558,37.6173" \
-                       --corner2 "55.7510,37.6250" \
-                       --max-zoom 13 \
-                       --url-template "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png" \
-                       --output "moscow.mbtiles" \
-                       --concurrency 5
+command: 
+      - "node"
+      - "--max-old-space-size=4096"
+      - "--expose-gc"
+      - "index.js"
+      - "download"
+      - "--min-zoom"
+      - "0"
+      - "--max-zoom"
+      - "16"
+      - "--url-template"
+      - "http://192.168.1.68:8080/tile/{z}/{x}/{y}.png"
+      - "--output"
+      - "/app/output/china.mbtiles"
+      - "--convert-pmtiles"
+      - "--concurrency"
+      - "20"
+      - "--batch-size"
+      - "2000"
 ```
 
 #### Download Parameters
 
+- `--geojson`: polygon geojson，default china.geojson
 - `--corner1`: First corner coordinates in format "lat,lng"
 - `--corner2`: Second corner coordinates in format "lat,lng"  
 - `--max-zoom`: Maximum zoom level (0-20+)
@@ -54,6 +68,29 @@ node index.js download --corner1 "55.7558,37.6173" \
 - `--batch-size`: Single batch downloads count (default: 1000)
 - `--convert-pmtiles`: Automatically convert output to PMTiles format after download
 - `--pmtiles-path <path>`: Path to pmtiles executable (default: same directory)
+
+
+### Convert Command
+
+Convert mbtiles to pmTiles format :
+
+```bash
+command: 
+    - "node"
+    - "--max-old-space-size=8000"
+    - "--expose-gc"
+    - "index.js"
+    - "convert"
+    - "--input"
+    - "./output/china.mbtiles"
+```
+
+#### Convert Parameters
+
+- `--input`: mbtiles的路径
+- `--output`: 输出文件路径
+- `--pmtiles-path <path>`: Path to pmtiles executable (default: same directory)
+
 
 ### Test Command
 

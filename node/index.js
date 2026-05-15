@@ -6,6 +6,7 @@ const axios = require("axios");
 const path = require("path");
 const fs = require("fs");
 const turf = require("@turf/turf");
+const { spawn } = require("child_process"); // 新增这一行
 
 class TileDownloader {
   constructor(options) {
@@ -37,6 +38,9 @@ class TileDownloader {
     this.concurrency = parseInt(options.concurrency) || 10;
     this.batchSize = parseInt(options.batchSize) || 500;
     this.retryLimit = 3;
+
+    this.convertToPMTiles = options.convertToPMTiles || false;
+    this.pmtilesPath = options.pmtilesPath || path.join(__dirname, "pmtiles");
 
     if (!this.outputFile) throw new Error("输出文件名不能为空");
   }
@@ -112,10 +116,6 @@ class TileDownloader {
 
     for (let x = xMin; x <= xMax; x++) {
       for (let y = yMin; y <= yMax; y++) {
-        if (this.targetGeometry) {
-          const pt = turf.point(this.num2deg(x + 0.5, y + 0.5, zoom));
-          if (!turf.booleanPointInPolygon(pt, this.targetGeometry)) continue;
-        }
         yield { z: zoom, x, y };
       }
     }
@@ -354,7 +354,15 @@ program
   .requiredOption("--output <file>")
   .option("--concurrency <n>", "并发数", "10")
   .option("--batch-size <n>", "批次大小", "1000")
-  .option("--convert-pmtiles", "自动转换")
+  .option(
+    "--convert-pmtiles",
+    "Automatically convert output to PMTiles format after download",
+  )
+  .option(
+    "--pmtiles-path <path>",
+    "Path to pmtiles executable (default: same directory)",
+    path.join(__dirname, "pmtiles"),
+  )
   .action(async (opts) => {
     let geoJson = null,
       tl = null,
@@ -386,9 +394,58 @@ program
       concurrency: opts.concurrency,
       batchSize: opts.batchSize,
       convertToPMTiles: opts.convertPmtiles,
+      pmtilesPath: opts.pmtilesPath,
     });
 
     await downloader.download();
+  });
+
+program
+  .command("convert")
+  .description("将现有的 MBTiles 文件转换为 PMTiles 格式")
+  .requiredOption("--input <file>", "源 MBTiles 文件路径")
+  .option("--output <file>", "目标 PMTiles 文件路径（可选，默认替换后缀）")
+  .option(
+    "--pmtiles-path <path>",
+    "pmtiles 可执行文件路径",
+    path.join(__dirname, "pmtiles"),
+  )
+  .action(async (opts) => {
+    const inputFile = opts.input.trim();
+    const outputFile = opts.output
+      ? opts.output.trim()
+      : inputFile.replace(/\.mbtiles$/i, ".pmtiles");
+    const cmd = fs.existsSync(opts.pmtilesPath) ? opts.pmtilesPath : "pmtiles";
+
+    if (!fs.existsSync(inputFile)) {
+      console.error(`错误: 找不到输入文件 ${inputFile}`);
+      return;
+    }
+
+    console.log(
+      `\n📦 正在转换: ${path.basename(inputFile)} -> ${path.basename(outputFile)}`,
+    );
+
+    const startTime = Date.now();
+    const child = spawn(cmd, ["convert", inputFile, outputFile]);
+
+    child.stdout.on("data", (data) => {
+      process.stdout.write(`[pmtiles] ${data}`);
+    });
+
+    child.stderr.on("data", (data) => {
+      process.stderr.write(`[错误] ${data}`);
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`\n✅ 转换完成！耗时: ${duration}s`);
+        console.log(`文件位置: ${outputFile}`);
+      } else {
+        console.error(`\n❌ 转换失败，退出码: ${code}`);
+      }
+    });
   });
 
 program
